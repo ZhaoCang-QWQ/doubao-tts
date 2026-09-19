@@ -29,6 +29,8 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, To
 logger = logging.getLogger("plugin.doubao_tts")
 
 SUPPORTED_CONFIG_VERSION = "1.7.1"
+ERROR_PROMPT_DEDUPE_SECONDS = 30.0
+"""同一会话失败提示的去重窗口（秒）：LLM 对失败有重试倾向，去重防提示刷屏。"""
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
 DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DOUBAO_RESOURCE_PRESET = "seed-tts-2.0"   # 预置音色（语音合成模型 2.0）
@@ -442,7 +444,7 @@ class BehaviorSectionConfig(PluginConfigBase):
 
     command_enabled: bool = Field(
         default=True,
-        description="是否启用 /说 /语音 手动命令",
+        description="是否启用 /说 /语音 手动命令（只影响手动命令；麦麦自主语音由 auto_voice_mode 控制，不受此项影响）",
         json_schema_extra={"label": "手动命令"},
     )
     auto_voice_mode: Literal["llm", "probability", "off"] = Field(
@@ -504,6 +506,32 @@ class BehaviorSectionConfig(PluginConfigBase):
         description="合成失败时向用户发一句提示",
         json_schema_extra={"label": "失败提示"},
     )
+    sync_chat_context: bool = Field(
+        default=True,
+        description=(
+            "发送语音后把原文写回麦麦的对话上下文。"
+            "语音消息本身不带文字（可见文本只有「[语音消息]」），不写回去的话，"
+            "麦麦下一轮不知道自己说过什么"
+        ),
+        json_schema_extra={"label": "同步对话上下文"},
+    )
+    context_prefix: str = Field(
+        default="[语音]",
+        description="写回对话上下文时加在原文前面的标记（表明这句是语音说的）；留空则不加",
+        json_schema_extra={"label": "上下文标记", "placeholder": "[语音]"},
+    )
+    command_cooldown_seconds: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "同一会话两次语音合成的最小间隔（秒），0=不限流（默认）。"
+            "TTS 按字符计费，手动命令对所有人开放时建议设置一个值（如 10）防刷屏/刷费用"
+        ),
+        json_schema_extra={
+            "label": "冷却限流（秒）",
+            "hint": "0=关闭。设置后同一会话在该时间内重复触发语音会被拒绝：命令回一句冷却提示，工具向 LLM 返回失败原因",
+        },
+    )
 
 
 class DoubaoTTSRootConfig(PluginConfigBase):
@@ -531,6 +559,10 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._pending_voice: Dict[str, float] = {}
         # 防递归：正在发送"概率语音"的标记
         self._sending_pending_voice: bool = False
+        # 会话 → 上次失败提示时间戳（去重窗口内不再重复提示）
+        self._last_error_prompt_at: Dict[str, float] = {}
+        # 会话 → 上次语音合成时间戳（冷却限流，防刷费用/刷屏）
+        self._last_speech_at: Dict[str, float] = {}
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -542,6 +574,33 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
     def _api_key(self) -> str:
         return str(self._get("doubao", "api_key", "") or "").strip()
+
+    # ── 冷却限流 ────────────────────────────────────────────────────────
+
+    def _cooldown_seconds(self) -> float:
+        try:
+            return max(0.0, float(self._get("behavior", "command_cooldown_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _cooldown_block(self, stream_id: str) -> bool:
+        """冷却限流：同一会话在冷却窗口内拒绝再次合成（防刷费用/刷屏）。
+
+        返回 True=本次被拦截。通过检查时记录本次时间戳。
+        对手动命令与麦麦自主 Tool 调用一并生效；概率模式由宿主驱动、每轮最多一次，不在此列。
+        """
+        cd = self._cooldown_seconds()
+        if cd <= 0:
+            return False
+        now = time.time()
+        last = self._last_speech_at.get(stream_id)
+        if last is not None and now - last < cd:
+            return True
+        self._last_speech_at[stream_id] = now
+        if len(self._last_speech_at) > 256:  # 防累积：清掉早已冷却完毕的会话
+            cutoff = now - max(cd, 60.0)
+            self._last_speech_at = {k: v for k, v in self._last_speech_at.items() if v >= cutoff}
+        return False
 
     # ── 概率自主语音 ────────────────────────────────────────────────────
 
@@ -622,10 +681,14 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         name="doubao_tts_probability_speak",
         description="概率模式：待语音会话的文字回复转成语音发出",
         order=HookOrder.EARLY,
+        # 本钩子内要做语音合成（一条回复可能切分成多段），宿主默认 5 秒不够：
+        # 超时会被记入插件熔断，连续超时会让本插件的钩子被停用。
+        # 显式放宽到 30 秒；真的超时也会按 ErrorPolicy.SKIP 放行，原文照发。
+        timeout_ms=30000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def _on_before_send(self, **kwargs: Any) -> Dict[str, Any]:
-        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 转语音并中止原文字。"""
+        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 原地换成语音（不中止原消息）。"""
         if self._sending_pending_voice:
             return {"action": "continue"}
         message = kwargs.get("message")
@@ -650,13 +713,58 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info("[豆包TTS] 概率语音：会话 %s 文字回复 → 语音（%d字）", session_id, len(text))
         self._sending_pending_voice = True
         try:
-            ok, note = await self._handle_speech(text, session_id, "概率语音")
-            if not ok:
-                self.ctx.logger.warning("[豆包TTS] 概率语音失败: %s（已按配置降级处理）", note)
-            # 无论成功失败，都 abort 原文字（失败已由 _handle_speech 降级为文字发出）
-            return {"action": "abort"}
+            return await self._replace_with_voice(message, text, kwargs)
         finally:
             self._sending_pending_voice = False
+
+    async def _replace_with_voice(
+        self,
+        message: Dict[str, Any],
+        text: str,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """把一条待发的文字消息原地换成语音消息（返回 Hook 结果字典）。
+
+        为什么不沿用「中止原消息 + 自己另发语音」：宿主 send_service 一旦 abort，
+        发送函数返回 None，麦麦的 reply 工具会把本轮回复判为"发送失败"并交回 planner，
+        LLM 看到失败便会重发 → 语音和文字就会反复出现。原地替换则让原消息正常走完
+        发送流程：reply 拿到成功结果、消息照常入库，一次发送就完成。
+        合成失败时返回 continue，原文照常发出，不会丢内容。
+        """
+        if not self._api_key():
+            self.ctx.logger.warning("[豆包TTS] 未配置 API Key，本条保持文字")
+            return {"action": "continue"}
+        session_id = str(message.get("session_id") or "").strip()
+        max_len = max(1, int(self._get("behavior", "max_text_length", 150) or 150))
+        # 与手动命令 / Tool 路径一致：先按配置决定是否翻译，再切分逐段合成
+        tts_text = await self._translate_if_needed(text)
+        segments = _split_sentences(tts_text, max_len)
+        if not segments:
+            return {"action": "continue"}
+        voice_segments: List[Dict[str, Any]] = []
+        for seg in segments:
+            success, audio, info = await self._synthesize_one(seg)
+            if not success or not audio:
+                self.ctx.logger.warning("[豆包TTS] 分段合成失败，整条回退为文字: %s", info)
+                return {"action": "continue"}
+            voice_segments.append({
+                "type": "voice",
+                # data 留空：可见文本只会渲染成「[语音消息]」，
+                # 不会把一长串 base64 灌进麦麦的对话上下文
+                "data": "",
+                "hash": "",
+                "binary_data_base64": base64.b64encode(audio).decode("ascii"),
+            })
+        new_message = dict(message)
+        new_message["raw_message"] = voice_segments
+        self.ctx.logger.info(
+            "[豆包TTS] 概率语音：会话 %s 已把文字回复换成 %d 条语音", session_id, len(voice_segments)
+        )
+        # 语音本身不带文字，另外把原文补进对话上下文
+        if self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(session_id, text)
+        # modified_kwargs 会整体替换宿主侧 hook 的 kwargs，故必须带上其余参数
+        return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
@@ -878,14 +986,46 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 异常: %s", exc, exc_info=True)
             return False, b"", f"错误: {exc}"
 
-    async def _send_voice(self, audio: bytes, stream_id: str) -> bool:
-        """把音频 base64 后经 send.custom("voice") 发到会话。"""
+    async def _send_voice(self, audio: bytes, stream_id: str, text: str = "") -> bool:
+        """把音频 base64 后经 send.custom("voice") 发到会话，并把原文写回对话上下文。
+
+        只发语音是不够的：宿主 send_service 的 sync_to_maisaka_history 默认关闭，
+        且语音组件的可见文本只会渲染成「[语音消息]」，麦麦下一轮既不知道自己发过语音、
+        也不知道说了什么。这里补两件事（可用 sync_chat_context 关闭）：
+          1) processed_plain_text 让入库的语音消息带着文字（长期记忆能检索到这句话）；
+          2) maisaka.context.append 把原文写回对话历史（planner / replyer 读的就是它）。
+        """
         try:
             b64 = base64.b64encode(audio).decode("ascii")
-            return bool(await self.ctx.send.custom("voice", b64, stream_id))
+            ok = bool(
+                await self.ctx.send.custom("voice", b64, stream_id, processed_plain_text=text)
+            )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("[豆包TTS] 发送语音失败: %s", exc)
             return False
+
+        if ok and text and self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(stream_id, text)
+        return ok
+
+    async def _append_chat_context(self, stream_id: str, text: str) -> None:
+        """把刚说出去的话写回麦麦的对话上下文。"""
+
+        prefix = str(self._get("behavior", "context_prefix", "") or "").strip()
+        visible = f"{prefix}{text}" if prefix else text
+        try:
+            result = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "data": visible}],
+                visible_text=visible,
+                source_kind="guided_reply",
+            )
+            if isinstance(result, dict) and not result.get("success", True):
+                self.ctx.logger.warning(
+                    "[豆包TTS] 同步对话上下文失败: %s", result.get("error", "未知原因")
+                )
+        except Exception as exc:  # noqa: BLE001 同步失败不该影响已经发出去的语音
+            self.ctx.logger.warning("[豆包TTS] 同步对话上下文异常: %s", exc)
 
     async def _speech(self, text: str, stream_id: str, overrides: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """把整段文本切成多条语音逐段发送。返回 (是否全部成功, 说明)。"""
@@ -901,7 +1041,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             if not success:
                 self.ctx.logger.warning("[豆包TTS] 第 %d/%d 段失败: %s", i + 1, total, info)
                 continue
-            if await self._send_voice(audio, stream_id):
+            if await self._send_voice(audio, stream_id, seg):
                 ok += 1
                 last_voice = info
             await asyncio.sleep(0.35)
@@ -1028,6 +1168,14 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             await self._maybe_error(stream_id, msg)
             return False, "API Key 未配置"
 
+        # 冷却限流（可选，默认关闭）：同一会话短时间内重复触发一律拒绝（防刷屏/刷费用）
+        if self._cooldown_block(stream_id):
+            cd = self._cooldown_seconds()
+            self.ctx.logger.info("[豆包TTS] 触发冷却限流(%s): stream=%s", source, stream_id)
+            if source == "命令":
+                await self._maybe_error(stream_id, f"语音合成冷却中，请 {cd:.0f} 秒后再试")
+            return False, "触发限流"
+
         ov = overrides if isinstance(overrides, dict) else {}
         self.ctx.logger.info(
             "[豆包TTS] %s 触发语音: %d字 覆盖=%s", source, len(text), json.dumps({k: v for k, v in ov.items() if v is not None}, ensure_ascii=False) or "-"
@@ -1042,25 +1190,44 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if self._get("behavior", "fallback_to_text", True):
             try:
                 await self.ctx.send.text(text, stream_id)
+                # 降级成文字时同样把原文写好上下文，行为才一致
+                if self._get("behavior", "sync_chat_context", True):
+                    await self._append_chat_context(stream_id, text)
                 return True, "语音合成失败，已改为文字回复"
             except Exception:
                 pass
         await self._maybe_error(stream_id, "语音合成失败了，请稍后再试")
         return False, note
 
-    async def _maybe_error(self, stream_id: str, msg: str) -> None:
-        if self._get("behavior", "send_error_prompt", True):
-            try:
-                await self.ctx.send.text(msg, stream_id)
-            except Exception:
-                pass
+    def _recently_prompted(self, stream_id: str) -> bool:
+        """该会话最近是否已收到过失败提示（去重窗口内）。"""
+
+        last = self._last_error_prompt_at.get(stream_id)
+        return last is not None and time.time() - last < ERROR_PROMPT_DEDUPE_SECONDS
+
+    async def _maybe_error(self, stream_id: str, msg: str) -> bool:
+        """向用户发失败提示；同一会话 30 秒内只发一次，防 LLM 重试刷屏。
+
+        Returns:
+            bool: 是否真的发出了提示。
+        """
+        if not self._get("behavior", "send_error_prompt", True):
+            return False
+        if self._recently_prompted(stream_id):
+            return False
+        self._last_error_prompt_at[stream_id] = time.time()
+        try:
+            await self.ctx.send.text(msg, stream_id)
+            return True
+        except Exception:
+            return False
 
     # ── Command：手动 ───────────────────────────────────────────────────
 
     @Command(
         "doubao_tts_say",
         description="用豆包语音把指定文本说出来",
-        pattern=r"(?<!\S)/(说|语音|speak)\s+(?P<text>.+)\s*$",
+        pattern=r"^/(说|语音|speak)\s+(?P<text>.+)\s*$",
     )
     async def _cmd_say(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple[bool, str, bool]:
         """/说 文本 / 语音 文本 / speak 文本"""
@@ -1080,7 +1247,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     @Command(
         "doubao_tts_help",
         description="查看豆包语音帮助",
-        pattern=r"(?<!\S)/(语音帮助|说帮助|tts帮助)\s*$",
+        pattern=r"^/(语音帮助|说帮助|tts帮助)\s*$",
     )
     async def _cmd_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, bool]:
         """/语音帮助"""
@@ -1160,9 +1327,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return {"success": False, "message": "缺少 stream_id，无法发送语音"}
         if not (text or "").strip():
             return {"success": False, "message": "text 为空，未发送"}
-        # Tool 模式跟随总开关：手动命令/命令开关控制 /说；自主语音方式为 off 时禁用 LLM 自主
-        if not self._get("behavior", "command_enabled", True):
-            return {"success": False, "message": "语音功能当前已禁用"}
+        # 麦麦自主语音只由「自主语音方式」管控（off=麦麦不自主）；
+        # 「手动命令」开关只管 /说 命令，不该挡这里——否则关掉手动命令后，
+        # 麦麦每次调用本工具都会失败（返回"语音功能当前已禁用"）。
         if self._auto_voice_mode() == "off":
             return {"success": False, "message": "麦麦自主语音已关闭（behavior.auto_voice_mode=off），请使用 /说 手动命令"}
         # 语速/音量为连续数值，仅支持手动固定（不在此工具参数中提供）
@@ -1175,7 +1342,11 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
             return {"success": True, "message": note}
-        return {"success": False, "message": f"语音失败：{note}"}
+        msg = f"语音失败：{note}"
+        if "限流" in note:
+            # 冷却期内重试必然还是失败，明确引导 LLM 别连续重试
+            msg += "；冷却期内重试仍会失败，请直接转告用户稍后再试，不要连续重试"
+        return {"success": False, "message": msg}
 
 
 def create_plugin() -> MaiBotPlugin:

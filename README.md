@@ -48,7 +48,8 @@
 1. **触发**：你发 `/说 文本`（或麦麦通过 Tool 自主决定用语音）；
 2. **合成**：插件把文本 POST 给火山豆包语音接口，流式接收音频（mp3）；
 3. **发送**：音频 base64 后经 `send.custom("voice")` 发到当前会话，无需写临时文件；
-4. **兜底**：合成失败时可按配置降级为文字发出，不让对话干等。
+4. **兜底**：合成失败时可按配置降级为文字发出，不让对话干等；
+5. **回写上下文**：语音发出后把原文写回麦麦的对话历史（`[behavior] sync_chat_context`，默认开，可加 `context_prefix` 标记）——语音消息本身不带文字，不写回去的话麦麦下一轮不知道自己说过什么。
 
 ---
 
@@ -88,6 +89,9 @@ max_tokens = 800                      # 译文上限（自动放大，一般不�
 auto_voice_mode = "llm"               # 麦麦自主语音：llm / probability / off（下拉）
 emotion_mode = "fixed"                # 情感来源：fixed=用 [voice_tone] emotion / auto=麦麦现场挑（下拉）
 emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下拉）
+sync_chat_context = true              # 发语音后把原文写回麦麦的对话上下文（默认开）
+context_prefix = "[语音]"             # 写回上下文时加在原文前的标记（默认 [语音]，留空则不加）
+command_cooldown_seconds = 0          # 同一会话两次合成的最小间隔（秒），0=不限流；建议公开命令时设 10
 ```
 
 **API Key 在哪拿**：火山引擎控制台 → 豆包语音 → **API Key 管理** → 新建/复制。需先开通"语音合成大模型"服务（控制台 → 开通管理）。

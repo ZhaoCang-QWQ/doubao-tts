@@ -38,7 +38,7 @@ model_task = "utils"      # 用哪个麦麦模型任务翻译（utils=小模型�
 max_tokens = 800          # 译文上限；插件会按原文长度自动放大（上限 4000），一般不用改
 
 [behavior]
-command_enabled = true       # 启用 /说 /语音 手动命令
+command_enabled = true       # 启用 /说 /语音 手动命令（只影响手动命令；麦麦自主语音由 auto_voice_mode 控制）
 auto_voice_mode = "llm"      # 麦麦自主语音：llm=由 LLM 自行判断何时用语音（推荐）；probability=按概率偶尔语音；off=仅手动命令
 auto_voice_probability = 0.1 # 概率模式的触发概率 0~1（0.1=平均每10轮约1轮语音），仅 probability 模式生效
 emotion_mode = "fixed"       # 情感来源：fixed=用 [voice_tone] emotion 固定值；auto=麦麦自主(llm模式)时由 LLM 现场挑
@@ -47,3 +47,6 @@ timeout_seconds = 30         # 请求超时（秒）
 max_text_length = 150        # 单条语音最大字数（超过按句切分多条）
 fallback_to_text = true      # 合成失败时降级为文字发出
 send_error_prompt = true     # 失败时提示用户
+sync_chat_context = true     # 发语音后把原文写回麦麦的对话上下文（否则麦麦下一轮不知道自己说过什么）
+context_prefix = "[语音]"    # 写回上下文时加在原文前的标记（表明这句是语音说的）；留空则不加
+command_cooldown_seconds = 0 # 同一会话两次合成的最小间隔（秒），0=不限流；命令对所有人开放时建议设置（如 10）防刷费用
